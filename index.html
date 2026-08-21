@@ -1069,6 +1069,47 @@
   // 배포하신 Apps Script 웹앱 주소. 팝업 안에서 바로 업로드가 완료됩니다.
   var APPS_SCRIPT_SNAP_URL = 'https://script.google.com/macros/s/AKfycbwChrC2wEZawpVsKk9sKpb1Qau1RcD0CTvcCFho35tF5ZPdrSumncXFVfkFI0jiDRBB/exec';
 
+  // 이미지 파일은 업로드 전에 브라우저에서 미리 축소합니다.
+  // (원본 그대로 base64로 보내면 용량이 너무 커져서 전송이 실패하거나
+  //  구글 앱스 스크립트의 처리 시간 제한에 걸리는 경우가 많습니다)
+  function compressImage(file){
+    return new Promise(function(resolve){
+      if(file.type.indexOf('image/') !== 0){
+        // 이미지가 아니면(동영상 등) 압축하지 않고 그대로 사용
+        fileToBase64(file).then(function(base64){
+          resolve({ filename: file.name, mimeType: file.type || 'application/octet-stream', data: base64 });
+        });
+        return;
+      }
+      var img = new Image();
+      var url = URL.createObjectURL(file);
+      img.onload = function(){
+        var maxDim = 1600;
+        var w = img.width, h = img.height;
+        if(w > maxDim || h > maxDim){
+          if(w > h){ h = Math.round(h * (maxDim / w)); w = maxDim; }
+          else { w = Math.round(w * (maxDim / h)); h = maxDim; }
+        }
+        var canvas = document.createElement('canvas');
+        canvas.width = w; canvas.height = h;
+        canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+        URL.revokeObjectURL(url);
+        var dataUrl = canvas.toDataURL('image/jpeg', 0.75);
+        var base64 = dataUrl.substring(dataUrl.indexOf(',') + 1);
+        var newFilename = file.name.replace(/\.[^.]+$/, '') + '.jpg';
+        resolve({ filename: newFilename, mimeType: 'image/jpeg', data: base64 });
+      };
+      img.onerror = function(){
+        // 이미지 디코딩에 실패하면 원본을 그대로 사용
+        URL.revokeObjectURL(url);
+        fileToBase64(file).then(function(base64){
+          resolve({ filename: file.name, mimeType: file.type || 'application/octet-stream', data: base64 });
+        });
+      };
+      img.src = url;
+    });
+  }
+
   function fileToBase64(file){
     return new Promise(function(resolve, reject){
       var reader = new FileReader();
@@ -1088,24 +1129,36 @@
     if(!name){ showToast('성함을 입력해주세요'); return; }
     if(!files || files.length === 0){ showToast('사진 또는 영상을 선택해주세요'); return; }
 
-    showToast('업로드 중이에요...');
+    // 동영상은 용량이 큰 경우가 많아 안내만 하고 그대로 진행합니다.
+    var hasLargeVideo = Array.prototype.some.call(files, function(f){
+      return f.type.indexOf('video/') === 0 && f.size > 25 * 1024 * 1024;
+    });
+    if(hasLargeVideo){
+      showToast('동영상 용량이 커서 업로드에 시간이 걸릴 수 있어요');
+    } else {
+      showToast('업로드 중이에요...');
+    }
 
     Promise.all(Array.prototype.map.call(files, function(file){
-      return fileToBase64(file).then(function(base64){
-        return { filename: file.name, mimeType: file.type || 'application/octet-stream', data: base64 };
-      });
+      return compressImage(file);
     })).then(function(fileList){
+      console.log('업로드 파일 개수:', fileList.length,
+        '총 용량(대략):', Math.round(fileList.reduce(function(sum, f){ return sum + f.data.length; }, 0) / 1024), 'KB');
+
+      // Apps Script 웹앱은 브라우저의 CORS 응답 헤더를 안 주기 때문에
+      // 일반 fetch로는 응답을 읽으려는 순간 요청 자체가 막혀버립니다.
+      // no-cors로 보내면 요청은 정상적으로 서버에 도착해서 실행됩니다
+      // (다만 응답 내용은 읽을 수 없어서, 아래에서는 성공 여부를 낙관적으로 표시해요).
       return fetch(APPS_SCRIPT_SNAP_URL, {
         method: 'POST',
+        mode: 'no-cors',
         body: JSON.stringify({ name: name, files: fileList })
       });
-    }).then(function(res){
-      return res.json ? res.json().catch(function(){ return {}; }) : {};
     }).then(function(){
       closeSnapModal();
       showToast('감사합니다. 소중한 순간이 업로드되었습니다');
     }).catch(function(err){
-      console.error(err);
+      console.error('스냅 업로드 실패:', err);
       showToast('업로드 중 문제가 발생했어요. 다시 시도해주세요');
     });
   }
